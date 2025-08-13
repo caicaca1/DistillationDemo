@@ -5,6 +5,8 @@ import copy
 import os
 from dataclasses import dataclass, field
 import sys
+import numpy as np
+import random
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
@@ -21,6 +23,9 @@ from parser import parse_args
 # 假设我们有DiT模型定义，类似于diffusers中的UNet
 # from my_models import DiTModel, DiTConfig # 这是一个假设的模型定义
 from diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel, AutoencoderKLHunyuanVideo
+from accelerate import init_empty_weights
+from dataset import DummyDataset, ParquetHunyuanMixkitDataset
+import psutil
 
 #TO DO： check FSDP; check scheduler; check memory usage
 
@@ -43,13 +48,16 @@ class DistillHunyuanArgs:
     # 模型路径
     hunyuan_model_path: str = "hunyuanvideo-community/HunyuanVideo" # 完整混元模型路径
     output_dir: str = "/work/hdd/bcjw/jcai2/hunyuan_distilled_output"
-
+    train_folder: str = "/work/hdd/bcjw/jcai2/dataset/mixkit-processed/combined_parquet_dataset/saved"
+    valid_folder: str = "/work/hdd/bcjw/jcai2/dataset/mixkit-processed/combined_parquet_dataset/saved"
+    max_samples: int = 100 # 训练时使用的最大样本数，None表示使用全部数据
     # 学生和批评家模型配置
     student_num_layers: int = 10  # 学生模型dual_layer数
     student_num_single_layers: int = 20 # 学生模型single layer数
     student_num_attention_heads: int = 18 # 学生模型注意力头数 10,20,18 刚好塞满一张卡 在vae先处理后的setting下
 
     # 训练参数
+    seed : int = 42
     learning_rate: float = 1e-5
     critic_learning_rate: float = 1e-5
     weight_decay: float = 1e-2
@@ -103,12 +111,22 @@ class HunyuanDistillationPipeline:
         self.fake_score_lr_scheduler = None
         
         os.makedirs(self.args.output_dir, exist_ok=True)
-          
+
+    def setup_pipeline(self):
+        # 加载模型和优化器
+        # 加载数据集
+        if self.args.FSDP:
+            self.setup_models_and_optimizers_FSDP()
+        else:
+            self.setup_models_and_optimizers()
+            self._set_dataset()
+            self._set_dataloaders() 
+
     def setup_models_and_optimizers(self):
         """
         初始化所有需要的模型、调度器和优化器。
         """
-        print("--- 正在设置模型和优化器 ---")
+        print("--- setting up models and optimizers ---")
         
         # --- 初始化三个核心DiT模型 ---
         # 1. teacher
@@ -130,7 +148,7 @@ class HunyuanDistillationPipeline:
                 ).to(self.device)
             if self.accelerator is not None:
                 self.noise_scheduler = self.accelerator.broadcast(self.noise_scheduler)
-        print(f"使用FlowMatching噪声调度器: {self.noise_scheduler.__class__.__name__}")
+        print(f"Using FlowMatching Scheduler: {self.noise_scheduler.__class__.__name__}")
         
         self.vae = self.teacher_pipe.vae
         
@@ -139,7 +157,7 @@ class HunyuanDistillationPipeline:
         self.teacher_transformer.eval()
         self.vae.requires_grad_(False)
         self.vae.eval()
-        print(f"教师模型 (teacher_hunyuan_dit) 加载完成并冻结。")
+        print(f"Teacher model (teacher_hunyuan) loaded and frozen.")
 
         # 2. 学生/生成器 (创建轻量化版本)
         teacher_config = self.teacher_transformer.config
@@ -147,9 +165,9 @@ class HunyuanDistillationPipeline:
         student_config["num_layers"] = self.args.student_num_layers
         student_config["num_single_layers"] = self.args.student_num_single_layers
         student_config["num_attention_heads"] = self.args.student_num_attention_heads
-        print(f"学生模型配置: {student_config}")
+        print(f"student model config: {student_config}")
         self.student_dit = HunyuanVideoTransformer3DModel.from_config(student_config).to(self.device)     
-        print(f"学生模型 (student_dit) 初始化完成。")
+        print(f"student model (student_dit) initialized。")
         self.student_dit.train()
             
         # ************************************************************************************
@@ -193,51 +211,59 @@ class HunyuanDistillationPipeline:
                 )
             
         if self.args.enable_checkpointing:
-            self.student_dit.enable_checkpointing()
+            self.student_dit.enable_gradient_checkpointing()
             if self.args.dmd:
-                self.fake_score_dit.enable_checkpointing()
-            print("学生模型启用检查点保存。")
-        print("--- 设置完成 ---")
+                self.fake_score_dit.enable_gradient_checkpointing()
+            print("Enable student model checkpointing")
+        print("--- setting done ---")
 
     def setup_models_and_optimizers_FSDP(self):
         """
         初始化所有需要的模型、调度器和优化器，兼容多进程 + FSDP。
         """
+        seed = 42
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        self._set_dataset()
+        self._set_dataloaders() 
+
         self.accelerator.print("--- 正在设置FSDP兼容的模型和优化器 ---")
 
         # ---------------------------
         # 1. 主进程负责预下载模型到本地缓存
         # ---------------------------
         # 使用 main_process_first() 确保下载只发生一次
-        with accelerator.main_process_first():
+        with self.accelerator.main_process_first():
             snapshot_download(repo_id="hunyuanvideo-community/HunyuanVideo")
-
+        
         # --------------------------
         # 2. 所有进程都从本地缓存加载自己的 teacher_pipe 实例
         # ---------------------------
         # 使用 low_cpu_mem_usage=True 可以优化内存使用，特别是在多进程环境下
         self.teacher_pipe = HunyuanVideoPipeline.from_pretrained(
             self.args.hunyuan_model_path, 
+            text_encoder=None,
+            text_encoder_2=None,
+            tokenizer=None,
+            tokenizer_2=None,
+            vae=None,
             torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True 
+            low_cpu_mem_usage=True
         ).to(self.device)
 
-        # 从 pipe 中提取需要的组件
+        self.accelerator.wait_for_everyone()
+
         self.teacher_transformer = self.teacher_pipe.transformer
         self.noise_scheduler = self.teacher_pipe.scheduler
-        self.text_encoder = self.teacher_pipe.text_encoder
-        self.text_encoder_2 = self.teacher_pipe.text_encoder_2
-        self.vae = self.teacher_pipe.vae
         
         # 冻结并移动到设备。这些组件不参与训练，所以手动管理
         self.teacher_transformer.requires_grad_(False)
         self.teacher_transformer.eval()
-        self.text_encoder.requires_grad_(False)
-        self.text_encoder.eval()
-        self.text_encoder_2.requires_grad_(False)
-        self.text_encoder_2.eval()
-        self.accelerator.print("所有进程的 Teacher Pipeline 加载完成并冻结。")
-
+        self.accelerator.print("Teacher Pipeline for all processes are loaded and frozen.")
+        #sys.exit(0) # Debugging: 先停止在这里
         # ---------------------------
         # 4. 初始化学生模型
         # ---------------------------
@@ -247,17 +273,34 @@ class HunyuanDistillationPipeline:
         student_config["num_single_layers"] = self.args.student_num_single_layers
         student_config["num_attention_heads"] = self.args.student_num_attention_heads
 
-        self.student_dit = HunyuanVideoTransformer3DModel.from_config(student_config)
+        self.accelerator.print("Initializing Student and Fake Score models.")
+        self.student_dit = HunyuanVideoTransformer3DModel.from_pretrained(
+                                                            self.args.hunyuan_model_path, 
+                                                            subfolder="transformer", 
+                                                            torch_dtype=torch.bfloat16
+                                                            )
         self.student_dit.train()
+        self.student_dit = self.accelerator.prepare(self.student_dit)
+        if self.args.dmd:
+            self.fake_score_dit = HunyuanVideoTransformer3DModel.from_pretrained(
+                                                                    self.args.hunyuan_model_path, 
+                                                                    subfolder="transformer", 
+                                                                    torch_dtype=torch.bfloat16
+                                                                    )
+            self.fake_score_dit.train()
+            self.fake_score_dit = self.accelerator.prepare(self.fake_score_dit)
+        #total_params = sum(p.numel() for p in self.student_dit.parameters())
+        #print("params of student_dit:", total_params)
 
         # ---------------------------
-        # 5. 初始化优化器 & 学习率调度器
+        # 6. 初始化优化器 & 学习率调度器
         # ---------------------------
         self.student_optimizer = torch.optim.AdamW(
             self.student_dit.parameters(),
             lr=self.args.learning_rate,
             weight_decay=self.args.weight_decay
         )
+        self.student_optimizer = self.accelerator.prepare(self.student_optimizer)
         self.student_lr_scheduler = get_scheduler(
             "cosine", optimizer=self.student_optimizer,
             num_warmup_steps=self.args.lr_warmup_steps,
@@ -265,41 +308,26 @@ class HunyuanDistillationPipeline:
         )
 
         if self.args.dmd:
-            self.accelerator.print("Initializing DMD fake score model...")
-            self.fake_score_dit = HunyuanVideoTransformer3DModel.from_config(student_config)
-            self.fake_score_dit.train()
-
             self.fake_score_optimizer = torch.optim.AdamW(
                 self.fake_score_dit.parameters(),
                 lr=self.args.learning_rate,
                 weight_decay=self.args.weight_decay
             )
+            self.fake_score_optimizer = self.accelerator.prepare(self.fake_score_optimizer)
             self.fake_score_lr_scheduler = get_scheduler(
                 "cosine", optimizer=self.fake_score_optimizer,
                 num_warmup_steps=self.args.lr_warmup_steps,
                 num_training_steps=self.args.max_train_iterations
             )
-
-        # ---------------------------
-        # 6. FSDP 分发
-        # ---------------------------
-
-        if self.args.dmd:
-            self.student_dit, self.fake_score_dit, self.student_optimizer, self.fake_score_optimizer, self.train_dataloader = self.accelerator.prepare(
-                self.student_dit, self.fake_score_dit, self.student_optimizer, self.fake_score_optimizer, self.train_dataloader
-            )
-        else:
-            self.student_dit, self.student_optimizer, self.train_dataloader = self.accelerator.prepare(
-                self.student_dit, self.student_optimizer, self.train_dataloader
-            )
-
+        self.train_dataloader = self.accelerator.prepare(self.train_dataloader)
         # ---------------------------
         # 7. FSDP checkpointing
         # ---------------------------
         if self.args.enable_checkpointing:
-            self.student_dit.enable_checkpointing()
+            self.accelerator.print("--- enable gradient checkpointing ---")
+            self.student_dit.enable_gradient_checkpointing()
             if self.args.dmd:
-                self.fake_score_dit.enable_checkpointing()
+                self.fake_score_dit.enable_gradient_checkpointing()
             self.accelerator.print("学生模型启用检查点保存。")
 
         self.accelerator.print("--- 设置完成 ---")
@@ -380,10 +408,9 @@ class HunyuanDistillationPipeline:
         """
         设置训练和验证数据集。先实现虚拟数据集
         """
-        from dataset import DummyDataset  
-
-        self.train_dataset = DummyDataset(length=1000, max_iterations=self.args.max_train_iterations)
-        self.validation_dataset = DummyDataset(length=100)
+          
+        self.train_dataset = ParquetHunyuanMixkitDataset(data_folder=self.args.train_folder, max_samples=self.args.max_samples)
+        self.validation_dataset = ParquetHunyuanMixkitDataset(data_folder=self.args.valid_folder, max_samples=self.args.max_samples)
         print("dataset 设置完成。")
         
     def _set_dataloaders(self):
@@ -417,7 +444,7 @@ class HunyuanDistillationPipeline:
         """
         随机选择一个时间步，用于生成噪声，返回形状为 [batch_size] 的 tensor。
         """
-        idx = torch.randint(0, len(self.noise_scheduler.timesteps), (batch_size,), device=self.device)
+        idx = torch.randint(0, len(self.noise_scheduler.timesteps), (batch_size,))
         sampled_timesteps = self.noise_scheduler.timesteps[idx].to(self.device)
         return sampled_timesteps
     
@@ -428,14 +455,13 @@ class HunyuanDistillationPipeline:
 
     def _get_inputs(self, batch_data: Dict[str, Any]):
         
-        video_tensors = batch_data["video"]
-        
         prompt = batch_data["prompt"]  
         prompt_2 = batch_data.get("prompt_2", prompt)
         prompt_embeds = batch_data.get("prompt_embeds", None)
         pooled_prompt_embeds = batch_data.get("pooled_prompt_embeds", None)
         prompt_attention_mask = batch_data.get("prompt_attention_mask", None)
-        
+        video_latents = batch_data.get("video_latents", None)
+
         prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.encode_prompt(
             prompt=prompt,
             prompt_2=prompt_2,
@@ -453,16 +479,17 @@ class HunyuanDistillationPipeline:
         batch_data["prompt_attention_mask"] = prompt_attention_mask.to(self.device)
         
         # 对视频进行VAE编码并采样 Hunyuan VAE的downsample rate是 4x8x8 之后patchify还有 1x2x2
-        #with autocast(dtype=torch.bfloat16):
-        #    video_latents = self.vae.encode(video_tensors.to(self.device)).latent_dist.sample()
-        # 对潜变量进行缩放
-        #video_latents = video_latents * self.vae.config.scaling_factor
-        #########################################
-        #Debugging: 先假装直接有处理后的latents
-        video_latents = video_tensors
-        #########################################
+        if video_latents is None:
+            with autocast(dtype=torch.bfloat16):
+                video_tensors = batch_data.get("video", None)
+                if video_tensors is not None:
+                    video_latents = self.vae.encode(video_tensors.to(self.device)).latent_dist.sample()
+                    # 对潜变量进行缩放
+                    video_latents = video_latents * self.vae.config.scaling_factor
+                else:
+                    raise AssertionError("No data provided!")
+
         batch_data['video_latents'] = video_latents.to(self.device)
-        batch_data.pop("video", None)  # 移除原始视频数据，节省内存
         return batch_data
     
     def _train_step(self, batch_data: Dict[str, Any], attention_kwargs: Optional[Dict[str, Any]] = None):
@@ -526,7 +553,9 @@ class HunyuanDistillationPipeline:
         pooled_prompt_embeds = batch_data["pooled_prompt_embeds"]
         prompt_attention_mask = batch_data["prompt_attention_mask"]
 
-        fixed_max_timestep = self.noise_scheduler.timesteps[0]
+        fixed_max_timestep = torch.tensor(
+            [self.noise_scheduler.timesteps[0]], device=self.device
+        )
 
         # 创建输入噪声
         noise = torch.randn_like(video_latents)
@@ -581,6 +610,7 @@ class HunyuanDistillationPipeline:
         pooled_prompt_embeds = batch_data["pooled_prompt_embeds"]
         prompt_attention_mask = batch_data["prompt_attention_mask"]
 
+        student_pred_video = student_pred_video.detach()
         # 随机采样时间步 t
         t = self._sample_timestep(video_latents.shape[0])
 
@@ -594,16 +624,17 @@ class HunyuanDistillationPipeline:
 
         # --- 2. teacher模型预测 ---
         with autocast(dtype=torch.bfloat16):
-            teacher_pred_noise = self.teacher_transformer(
-                        hidden_states=noisy_student_pred_video,
-                        timestep=t,
-                        encoder_hidden_states=prompt_embeds,
-                        encoder_attention_mask=prompt_attention_mask,
-                        pooled_projections=pooled_prompt_embeds,
-                        guidance=guidance_for_model,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
+            with torch.no_grad():
+                teacher_pred_noise = self.teacher_transformer(
+                            hidden_states=noisy_student_pred_video,
+                            timestep=t,
+                            encoder_hidden_states=prompt_embeds,
+                            encoder_attention_mask=prompt_attention_mask,
+                            pooled_projections=pooled_prompt_embeds,
+                            guidance=guidance_for_model,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                        )[0]
             fake_score_pred_noise = self.fake_score_dit(
                         hidden_states=noisy_student_pred_video,
                         timestep=t,
@@ -646,13 +677,14 @@ class HunyuanDistillationPipeline:
             with self.accelerator.autocast(), self.accelerator.accumulate(self.student_dit):
                 # 1. 准备输入数据
                 i = i + 1
+                print(i)
                 batch_data = self._get_inputs(batch_data)
                 
                 # 2. 执行训练步骤
-                regression_loss, student_pred_video, guidance_for_model = self._student_step(batch_data, attention_kwargs)
+                regression_loss, student_pred_video, guidance_for_model = self._student_one_step(batch_data, attention_kwargs)
                 
                 teacher_pred_video, fake_score_pred_video, diffusion_loss = self._dmd_step(batch_data, student_pred_video, attention_kwargs, guidance_for_model)
-
+                #sys.exit(0)
                 with torch.no_grad():
                     grad = (fake_score_pred_video - teacher_pred_video) / torch.abs(
                         student_pred_video - teacher_pred_video).mean()
@@ -661,35 +693,27 @@ class HunyuanDistillationPipeline:
                 dmd_loss = 0.5 * F.mse_loss(
                     student_pred_video.float(),
                     (student_pred_video.float() - grad.float()).detach())
-                
+
                 distill_loss = regression_loss + dmd_loss
+                total_loss = distill_loss + diffusion_loss
                 
                 self.student_optimizer.zero_grad(set_to_none=True)
-                self.accelerator.backward(distill_loss)
-                self.student_optimizer.step()
-                self.student_lr_scheduler.step()
-                
                 self.fake_score_optimizer.zero_grad(set_to_none=True)
-                # 注意：fake_score_loss 是在 autocast 上下文中计算的，所以它的反向传播也应该在这里进行
-                self.accelerator.backward(diffusion_loss)
+                self.accelerator.backward(total_loss)
+                self.student_optimizer.step()
                 self.fake_score_optimizer.step()
+                self.student_lr_scheduler.step()
                 self.fake_score_lr_scheduler.step()
 
                 dmd_losses += dmd_loss.detach().item()
                 regression_losses += regression_loss.detach().item()
                 diffusion_losses += diffusion_loss.detach().item()
-                print(dmd_losses)
-                sys.exit(0)
-            
-    def setup_pipeline(self):
-        # 加载模型和优化器
-        # 加载数据集
-        if self.args.FSDP:
-            self.setup_models_and_optimizers_FSDP()
-        else:
-            self.setup_models_and_optimizers()
-        self._set_dataset()
-        self._set_dataloaders() 
+                
+                if i == 4:
+                    self.accelerator.print(dmd_losses)
+                    self.accelerator.print(regression_losses)
+                    self.accelerator.print(diffusion_losses)
+                    sys.exit(0)
         
     def normal_train(self, attention_kwargs: Optional[Dict[str, Any]] = None,):
         
@@ -743,9 +767,8 @@ if __name__ == '__main__':
         )
     # 2. 初始化蒸馏管线
     pipeline = HunyuanDistillationPipeline(args, accelerator)
-    
+    print(vars(cli_args))
     # 3. 设置模型和优化器
-    #pipeline.normal_train()
     if args.dmd:
         pipeline.dmd_distill()
     else:

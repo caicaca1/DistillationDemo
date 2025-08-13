@@ -6,8 +6,8 @@ fsdp_config:
   fsdp_sharding_strategy: FULL_SHARD # 1表示分片参数，2表示分片参数+梯度，FULL_SHARD最节省内存
   fsdp_state_dict_type: SHARDED_STATE_DICT
 machine_rank: 0
-main_process_port: 29500
+main_process_port: 29501
 mixed_precision: 'bf16' # H100上使用bf16
 num_machines: 1
-num_processes: 8 # 你的GPU数量
+num_processes: 4 # 你的GPU数量
 use_cpu: false

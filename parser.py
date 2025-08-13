@@ -6,9 +6,9 @@ def parse_args():
     parser.add_argument("--hunyuan_model_path", type=str, default="hunyuanvideo-community/HunyuanVideo")
     parser.add_argument("--output_dir", type=str, default="/work/hdd/bcjw/jcai2/hunyuan_distilled_output")
 
-    parser.add_argument("--student_num_layers", type=int, default=10)
-    parser.add_argument("--student_num_single_layers", type=int, default=20)
-    parser.add_argument("--student_num_attention_heads", type=int, default=18)
+    parser.add_argument("--student_num_layers", type=int, default=20)
+    parser.add_argument("--student_num_single_layers", type=int, default=40)
+    parser.add_argument("--student_num_attention_heads", type=int, default=24)
 
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--critic_learning_rate", type=float, default=1e-5)
